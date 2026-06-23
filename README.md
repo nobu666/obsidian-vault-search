@@ -81,6 +81,23 @@ Before answering, recall from my notes:
 
 Now the agent surfaces relevant past decisions, daily logs, and knowledge notes on its own — even when your wording today doesn't match what you wrote months ago.
 
+## Use it from Obsidian (no plugin needed)
+
+Prefer to stay inside Obsidian? You don't need a dedicated plugin — drive this CLI with the community [**Shell commands**](https://github.com/Taitava/obsidian-shellcommands) plugin:
+
+1. Install **Shell commands** (Settings → Community plugins).
+2. Add a shell command, for example:
+   ```
+   VAULT_DIR="/absolute/path/to/your/vault" /absolute/path/to/vault-search "{{query}}"
+   ```
+   - Use an **absolute path** to `vault-search`. GUI apps often don't inherit your shell `PATH`, so a bare `vault-search` may not resolve.
+   - Bind `{{query}}` to a Shell commands **prompt** for free-text input, or use the built-in `{{selection}}` variable to search for the currently selected text.
+3. Route the command's **output to a modal or notification** so you can read the hits and jump to the file.
+
+Add a second command for `… /vault-search index` (or run it on a schedule) to keep the index fresh.
+
+This path is desktop-only — it shells out to a local binary. It's the zero-rewrite way to use vault-search inside Obsidian; a native, cross-platform plugin would be a separate TypeScript project.
+
 ## How it works
 
 1. **Chunk** each `.md` by heading; split overly long sections on paragraph boundaries.
