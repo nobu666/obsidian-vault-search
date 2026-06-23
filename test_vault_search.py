@@ -119,6 +119,13 @@ class VaultSearchTest(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 m.cosine_topn([1.0, 0.0], 5)        # index is 3-dim, query is 2-dim
 
+    def test_snippet_strips_control_and_bidi(self):
+        m = load_module(self.vault, self.db)
+        s = m.make_snippet("alpha\x1b[31mRED\x1b[0m" + chr(0x202e) + "beta")
+        self.assertNotIn("\x1b", s)            # ANSI escape removed
+        self.assertNotIn(chr(0x202e), s)       # bidi override removed
+        self.assertIn("alpha", s)              # visible text preserved
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

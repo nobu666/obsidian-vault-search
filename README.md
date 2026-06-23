@@ -21,7 +21,7 @@ It's built to be called by a coding agent (Claude Code, etc.) at the start of a 
 
 - **vs Smart Connections / Copilot (Obsidian plugins):** those live inside the Obsidian GUI. This is a CLI, so an external agent or a shell script can drive it.
 - **vs khoj:** khoj is great but heavyweight (a long-running server, many dependencies). This is one file, stdlib only, brute-force cosine — readable in a sitting and trivial to audit.
-- **Fully local & private:** the only network call is to your local Ollama. Note contents never leave the machine.
+- **Local & private by default:** the only network call goes to your Ollama endpoint, which defaults to `localhost` — so note contents stay on your machine. (Point `OLLAMA_HOST` at a remote server and they will be sent there.)
 
 ## Requirements
 
@@ -112,6 +112,7 @@ Incremental indexing compares file mtimes; deleted files are pruned on the next 
 - Keyword matching is substring-based, so single-character CJK queries are weak — semantic recall covers that gap.
 - Line numbers for sub-split long sections point at the section start, not the exact sub-chunk.
 - Optimized for recall over precision: it errs toward surfacing a few extra candidates.
+- Results are raw note text. If your vault holds untrusted content (web clippings, others' documents), treat surfaced snippets as untrusted input — when fed to an AI agent they can act as injected instructions (prompt injection). The agent consuming them should treat them as data, not commands.
 
 ## Development
 

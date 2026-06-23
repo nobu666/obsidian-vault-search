@@ -2,7 +2,7 @@
 """vault-search — hybrid (keyword + embedding) search over an Obsidian/Markdown vault.
 
 Fully local: embeddings come from Ollama over HTTP, the index is plain SQLite.
-Notes never leave the machine.
+With the default localhost Ollama, note contents never leave the machine.
 
 Usage:
   vault-search index [--rebuild]       update the index (incremental; --rebuild wipes first)
@@ -28,6 +28,15 @@ EXCLUDE_DIRS = {".obsidian", ".trash", ".git"}
 MAX_CHUNK = 1500   # characters; sections longer than this are split on paragraphs
 EMBED_BATCH = 32
 RRF_K = 60
+
+# Codepoint ranges stripped from displayed snippets. Notes may hold untrusted
+# content (web clippings, etc.) and snippets print to a terminal and/or feed an
+# AI agent, so drop C0 controls + DEL (ANSI escapes) and zero-width / bidi-override
+# formatting that could spoof the displayed text. (Tab/LF/CR are left to \s+.)
+_STRIP_RANGES = (
+    (0x00, 0x08), (0x0b, 0x0c), (0x0e, 0x1f), (0x7f, 0x7f),
+    (0x200b, 0x200f), (0x202a, 0x202e), (0x2066, 0x2069),
+)
 
 
 def die(msg):
@@ -196,7 +205,8 @@ def keyword_hits(query):
 
 
 def make_snippet(txt, n=140):
-    s = re.sub(r"\s+", " ", txt).strip()
+    s = "".join(c for c in txt if not any(lo <= ord(c) <= hi for lo, hi in _STRIP_RANGES))
+    s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"^#{1,6}\s*", "", s)
     return s[:n] + ("…" if len(s) > n else "")
 
@@ -233,7 +243,7 @@ def cmd_search(query, k):
 
 
 def cmd_selfcheck():
-    """Verify core logic (cosine / chunking / RRF) without Ollama or the DB."""
+    """Verify core logic (cosine / chunking / RRF / snippet) without Ollama or the DB."""
     import tempfile
     # cosine: identical vectors -> 1, orthogonal -> 0
     a, b = normalize([1.0, 2.0, 3.0]), normalize([1.0, 2.0, 3.0])
@@ -250,6 +260,10 @@ def cmd_selfcheck():
         os.unlink(tmp)
     assert len(chunks) >= 3, f"chunking sections={len(chunks)}"
     assert chunks[0][0] == 1, "first chunk starts at line 1"
+    # snippet: control chars / bidi overrides are stripped
+    bad = "alpha\x1b[31mRED\x1b[0m" + chr(0x202e) + "beta"
+    snip = make_snippet(bad)
+    assert "\x1b" not in snip and chr(0x202e) not in snip and "alpha" in snip, "snippet sanitize"
     # RRF: an item present in both lists ranks on top
     emb, kw = {1: 1, 2: 2, 3: 3}, {3: 1, 4: 2}
     rrf = defaultdict(float)
