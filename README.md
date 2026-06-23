@@ -1,5 +1,7 @@
 # obsidian-vault-search
 
+[![tests](https://github.com/nobu666/obsidian-vault-search/actions/workflows/test.yml/badge.svg)](https://github.com/nobu666/obsidian-vault-search/actions/workflows/test.yml)
+
 Hybrid (keyword + semantic) local search over your Obsidian / Markdown vault — a single ~300-line Python CLI that feeds your AI agent's recall. No plugins, no cloud, no heavy framework. Just the standard library and a local [Ollama](https://ollama.com) embedding model.
 
 ```
@@ -93,6 +95,15 @@ Incremental indexing compares file mtimes; deleted files are pruned on the next 
 - Keyword matching is substring-based, so single-character CJK queries are weak — semantic recall covers that gap.
 - Line numbers for sub-split long sections point at the section start, not the exact sub-chunk.
 - Optimized for recall over precision: it errs toward surfacing a few extra candidates.
+
+## Development
+
+No dependencies to install — tests stub the embedding call, so Ollama isn't needed.
+
+```bash
+python3 vault-search selfcheck      # core math: cosine / chunking / RRF
+python3 test_vault_search.py        # incremental indexing, keyword, fusion
+```
 
 ## License
 
