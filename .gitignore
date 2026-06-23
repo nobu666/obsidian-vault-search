@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+# local index (regenerable, may sit here if VAULT_SEARCH_DB is overridden)
+*.db
+index.db

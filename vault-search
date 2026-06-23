@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""vault-search — Obsidian Vault の hybrid 検索（keyword + embedding）。
+
+ローカル完結: 埋め込みは Ollama(bge-m3) を HTTP で叩くだけ。索引は sqlite。
+ノートも会話も外に出さない。
+
+使い方:
+  vault-search index [--rebuild]       索引を更新（差分。--rebuild で全再構築）
+  vault-search "自然文クエリ" [-k N]    hybrid 検索（既定 top-8）
+  vault-search selfcheck               内部テスト（Ollama 不要）
+
+環境変数で上書き可:
+  VAULT_DIR           既定 ~/Documents/Obsidian/Vault
+  VAULT_SEARCH_DB     既定 ~/.cache/vault-search/index.db
+  VAULT_SEARCH_MODEL  既定 bge-m3
+  OLLAMA_HOST         既定 http://localhost:11434
+"""
+import os, sys, re, json, math, sqlite3, urllib.request, urllib.error
+from array import array
+from pathlib import Path
+from collections import defaultdict
+
+VAULT = Path(os.environ.get("VAULT_DIR", Path.home() / "Documents/Obsidian/Vault"))
+DB_PATH = Path(os.environ.get("VAULT_SEARCH_DB", Path.home() / ".cache/vault-search/index.db"))
+OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+MODEL = os.environ.get("VAULT_SEARCH_MODEL", "bge-m3")
+EXCLUDE_DIRS = {".obsidian", ".trash", ".git"}
+MAX_CHUNK = 1500   # 文字数。これを超える節は段落で分割
+EMBED_BATCH = 32
+RRF_K = 60
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------- embedding (Ollama) ----------
+def embed(texts):
+    """texts: list[str] -> list[list[float]]"""
+    out = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i:i + EMBED_BATCH]
+        req = urllib.request.Request(
+            f"{OLLAMA}/api/embed",
+            data=json.dumps({"model": MODEL, "input": batch}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                data = json.load(r)
+        except urllib.error.URLError as e:
+            die(f"Ollama に接続できません ({OLLAMA})。`ollama serve` 起動を確認: {e}")
+        embs = data.get("embeddings")
+        if not embs:
+            die(f"埋め込み取得失敗。モデル {MODEL} が無いかも: `ollama pull {MODEL}`（応答: {data}）")
+        out.extend(embs)
+    return out
+
+
+def normalize(vec):
+    n = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / n for x in vec]
+
+
+# ---------- chunking ----------
+def chunk_file(path):
+    """-> list[(line_no, text)]  見出し単位。長い節は段落で分割。"""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.split("\n")
+    sections, cur_start, cur = [], 0, []
+    for idx, ln in enumerate(lines):
+        if re.match(r"^#{1,6}\s", ln) and cur:
+            sections.append((cur_start, cur))
+            cur_start, cur = idx, [ln]
+        else:
+            if not cur:
+                cur_start = idx
+            cur.append(ln)
+    if cur:
+        sections.append((cur_start, cur))
+
+    chunks = []
+    for start, sec_lines in sections:
+        body = "\n".join(sec_lines).strip()
+        if not body:
+            continue
+        if len(body) <= MAX_CHUNK:
+            chunks.append((start + 1, body))
+            continue
+        # ponytail: 長節の分割は段落単位。サブchunkの行番号は節頭で近似（厳密追跡はやり過ぎ）
+        buf = ""
+        for p in re.split(r"\n\s*\n", body):
+            if buf and len(buf) + len(p) > MAX_CHUNK:
+                chunks.append((start + 1, buf.strip()))
+                buf = p
+            else:
+                buf = (buf + "\n\n" + p) if buf else p
+        if buf.strip():
+            chunks.append((start + 1, buf.strip()))
+    return chunks
+
+
+# ---------- db ----------
+def db_connect():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS chunks("
+                "id INTEGER PRIMARY KEY, path TEXT, line INTEGER, text TEXT, vec BLOB)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path)")
+    return con
+
+
+def iter_md():
+    for root, dirs, files in os.walk(VAULT):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        for f in files:
+            if f.endswith(".md"):
+                yield Path(root) / f
+
+
+def cmd_index(rebuild=False):
+    if not VAULT.is_dir():
+        die(f"VAULT が見つかりません: {VAULT}")
+    con = db_connect()
+    if rebuild:
+        con.execute("DELETE FROM files")
+        con.execute("DELETE FROM chunks")
+        con.commit()
+    stored = dict(con.execute("SELECT path, mtime FROM files").fetchall())
+    seen, changed, new_chunks = set(), 0, 0
+    for path in iter_md():
+        sp = str(path)
+        seen.add(sp)
+        mt = path.stat().st_mtime
+        if stored.get(sp) == mt:
+            continue
+        chunks = chunk_file(path)
+        con.execute("DELETE FROM chunks WHERE path=?", (sp,))
+        if chunks:
+            vecs = embed([c[1] for c in chunks])
+            if len(vecs) != len(chunks):  # 数が合わないと zip が黙ってchunkを落とす
+                die(f"埋め込み数とchunk数が不一致 ({len(vecs)}!={len(chunks)})。Ollama応答を確認")
+            for (line, txt), v in zip(chunks, vecs):
+                blob = array("f", normalize(v)).tobytes()
+                con.execute("INSERT INTO chunks(path, line, text, vec) VALUES(?,?,?,?)",
+                            (sp, line, txt, blob))
+            new_chunks += len(chunks)
+        con.execute("INSERT OR REPLACE INTO files(path, mtime) VALUES(?,?)", (sp, mt))
+        changed += 1
+        con.commit()
+    removed = 0
+    for sp in stored:
+        if sp not in seen:
+            con.execute("DELETE FROM chunks WHERE path=?", (sp,))
+            con.execute("DELETE FROM files WHERE path=?", (sp,))
+            removed += 1
+    con.commit()
+    total = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    print(f"index: {changed} files updated (+{new_chunks} chunks), {removed} removed. total chunks={total}")
+
+
+# ---------- search ----------
+def cosine_topn(qn, topn):
+    """qn: 正規化済みクエリベクトル -> [(score, cid)] 上位topn"""
+    con = db_connect()
+    qd = len(qn)
+    scored = []
+    for cid, blob in con.execute("SELECT id, vec FROM chunks"):
+        v = array("f")
+        v.frombytes(blob)
+        if len(v) != qd:  # モデル変更で次元がズレたら zip が黙って誤計算する。明示的に止める
+            die(f"ベクトル次元不一致 (query={qd}, index={len(v)})。"
+                f"モデルを変えたなら `vault-search index --rebuild` で作り直す")
+        # vもqnも正規化済み → dot = cosine。ponytail: 全件pure-python走査（実測~75ms/3千chunk、recall用途に十分）
+        scored.append((sum(a * b for a, b in zip(qn, v)), cid))
+    scored.sort(reverse=True)
+    return scored[:topn]
+
+
+def keyword_hits(query):
+    """索引済み chunk text を直接 substring マッチ。外部 rg 不要。 -> dict[cid] = マッチ語数"""
+    terms = [t.lower() for t in re.split(r"\s+", query.strip()) if len(t) >= 2] \
+        or [query.strip().lower()]
+    con = db_connect()
+    score = {}
+    for cid, txt in con.execute("SELECT id, text FROM chunks"):
+        low = txt.lower()
+        c = sum(1 for t in terms if t in low)
+        if c:
+            score[cid] = c
+    return score
+
+
+def make_snippet(txt, n=140):
+    s = re.sub(r"\s+", " ", txt).strip()
+    s = re.sub(r"^#{1,6}\s*", "", s)
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def cmd_search(query, k):
+    con = db_connect()
+    if con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0:
+        die("索引が空です。先に `vault-search index` を実行してください。")
+
+    qn = normalize(embed([query])[0])
+    emb = cosine_topn(qn, 50)
+    emb_rank = {cid: r for r, (_, cid) in enumerate(emb, 1)}
+
+    kw_score = keyword_hits(query)
+    kw_rank = {cid: r for r, (cid, _) in
+               enumerate(sorted(kw_score.items(), key=lambda x: -x[1]), 1)}
+
+    # RRF 融合
+    rrf = defaultdict(float)
+    for cid, r in emb_rank.items():
+        rrf[cid] += 1.0 / (RRF_K + r)
+    for cid, r in kw_rank.items():
+        rrf[cid] += 1.0 / (RRF_K + r)
+    ranked = sorted(rrf.items(), key=lambda x: -x[1])[:k]
+
+    if not ranked:
+        print("(no hits)")
+        return
+    for cid, _ in ranked:
+        p, ln, txt = con.execute("SELECT path, line, text FROM chunks WHERE id=?", (cid,)).fetchone()
+        rel = os.path.relpath(p, VAULT)
+        tag = "+".join([t for t, ok in (("emb", cid in emb_rank), ("kw", cid in kw_rank)) if ok])
+        print(f"{rel}:{ln}  [{tag}]  {make_snippet(txt)}")
+
+
+def cmd_selfcheck():
+    """Ollama も DB も使わず、コアロジック（cosine / chunking / RRF）を検証。"""
+    import tempfile
+    # cosine: 同一ベクトル=1、直交=0
+    a, b = normalize([1.0, 2.0, 3.0]), normalize([1.0, 2.0, 3.0])
+    assert abs(sum(x * y for x, y in zip(a, b)) - 1.0) < 1e-6, "cosine identical"
+    o1, o2 = normalize([1.0, 0.0]), normalize([0.0, 1.0])
+    assert abs(sum(x * y for x, y in zip(o1, o2))) < 1e-6, "cosine orthogonal"
+    # chunking: 見出し分割と長節の段落分割
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write("# A\nalpha\n\n## B\nbeta\n\n## C\n" + "x " * 2000)
+        tmp = f.name
+    try:
+        chunks = chunk_file(Path(tmp))
+    finally:
+        os.unlink(tmp)
+    assert len(chunks) >= 3, f"chunking sections={len(chunks)}"
+    assert chunks[0][0] == 1, "first chunk starts at line 1"
+    # RRF: 両リストに出る要素が最上位
+    emb, kw = {1: 1, 2: 2, 3: 3}, {3: 1, 4: 2}
+    rrf = defaultdict(float)
+    for cid, r in emb.items():
+        rrf[cid] += 1.0 / (RRF_K + r)
+    for cid, r in kw.items():
+        rrf[cid] += 1.0 / (RRF_K + r)
+    assert max(rrf, key=rrf.get) == 3, "RRF fuses overlap to top"
+    print("selfcheck: ok")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    if a[0] == "index":
+        cmd_index(rebuild=("--rebuild" in a))
+        return
+    if a[0] == "selfcheck":
+        cmd_selfcheck()
+        return
+    k = 8
+    if "-k" in a:
+        i = a.index("-k")
+        try:
+            k = int(a[i + 1])
+        except (IndexError, ValueError):
+            die("-k には数値を指定してください")
+        a = a[:i] + a[i + 2:]
+    query = " ".join(a).strip()
+    if not query:
+        die("クエリが空です")
+    cmd_search(query, k)
+
+
+if __name__ == "__main__":
+    main()
