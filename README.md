@@ -11,7 +11,7 @@ projects/api-rewrite.md:88   [kw]      TODO: revisit db pool sizing under load
 
 ## Why
 
-Keyword search (`grep`/`rg`) is high precision, low recall: it misses notes that say the same thing in different words, and it can't find a dated daily-log file (`メモ/2026-06-23.md`) unless you remember the date. Embedding search fixes recall but drifts on precision. This tool fuses both with [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), so you get semantic recall *and* exact-term precision in one ranked list.
+Keyword search (`grep`/`rg`) is high precision, low recall: it misses notes that say the same thing in different words, and it can't find a dated daily-log file (`daily/2024-11-08.md`) unless you remember the date. Embedding search fixes recall but drifts on precision. This tool fuses both with [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), so you get semantic recall *and* exact-term precision in one ranked list.
 
 It's built to be called by a coding agent (Claude Code, etc.) at the start of a turn, so the agent can pull relevant past notes into context before answering — but it works fine as a plain CLI too.
 
