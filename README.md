@@ -3,9 +3,10 @@
 Hybrid (keyword + semantic) local search over your Obsidian / Markdown vault — a single ~300-line Python CLI that feeds your AI agent's recall. No plugins, no cloud, no heavy framework. Just the standard library and a local [Ollama](https://ollama.com) embedding model.
 
 ```
-$ vault-search "how did I set up gitleaks last time"
-メモ/2026-06-23.md:45  [emb+kw]  gitleaks setup (same day) — enabled in ~/repos/dotfiles via `git config hooks.gitleaks true` ...
-Knowledge/dotfiles-backup.md:34  [emb]   cause 1 (scan gap): the secret scan only covered home/ and claude/ ...
+$ vault-search "that postgres connection pool issue"
+daily/2024-11-08.md:42       [emb+kw]  fixed pool exhaustion — bumped max connections and put pgbouncer in front ...
+notes/postgres-tuning.md:15  [emb]     connection pooling: prefer transaction mode for short-lived queries ...
+projects/api-rewrite.md:88   [kw]      TODO: revisit db pool sizing under load
 ```
 
 ## Why
