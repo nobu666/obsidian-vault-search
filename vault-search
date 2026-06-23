@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""vault-search — Obsidian Vault の hybrid 検索（keyword + embedding）。
+"""vault-search — hybrid (keyword + embedding) search over an Obsidian/Markdown vault.
 
-ローカル完結: 埋め込みは Ollama(bge-m3) を HTTP で叩くだけ。索引は sqlite。
-ノートも会話も外に出さない。
+Fully local: embeddings come from Ollama over HTTP, the index is plain SQLite.
+Notes never leave the machine.
 
-使い方:
-  vault-search index [--rebuild]       索引を更新（差分。--rebuild で全再構築）
-  vault-search "自然文クエリ" [-k N]    hybrid 検索（既定 top-8）
-  vault-search selfcheck               内部テスト（Ollama 不要）
+Usage:
+  vault-search index [--rebuild]       update the index (incremental; --rebuild wipes first)
+  vault-search "natural language query" [-k N]   hybrid search (default top-8)
+  vault-search selfcheck               run internal tests (no Ollama needed)
 
-環境変数で上書き可:
-  VAULT_DIR           既定 ~/Documents/Obsidian/Vault
-  VAULT_SEARCH_DB     既定 ~/.cache/vault-search/index.db
-  VAULT_SEARCH_MODEL  既定 bge-m3
-  OLLAMA_HOST         既定 http://localhost:11434
+Environment overrides:
+  VAULT_DIR           default ~/Documents/Obsidian/Vault
+  VAULT_SEARCH_DB     default ~/.cache/vault-search/index.db
+  VAULT_SEARCH_MODEL  default bge-m3
+  OLLAMA_HOST         default http://localhost:11434
 """
 import os, sys, re, json, math, sqlite3, urllib.request, urllib.error
 from array import array
@@ -25,7 +25,7 @@ DB_PATH = Path(os.environ.get("VAULT_SEARCH_DB", Path.home() / ".cache/vault-sea
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.environ.get("VAULT_SEARCH_MODEL", "bge-m3")
 EXCLUDE_DIRS = {".obsidian", ".trash", ".git"}
-MAX_CHUNK = 1500   # 文字数。これを超える節は段落で分割
+MAX_CHUNK = 1500   # characters; sections longer than this are split on paragraphs
 EMBED_BATCH = 32
 RRF_K = 60
 
@@ -50,10 +50,10 @@ def embed(texts):
             with urllib.request.urlopen(req, timeout=300) as r:
                 data = json.load(r)
         except urllib.error.URLError as e:
-            die(f"Ollama に接続できません ({OLLAMA})。`ollama serve` 起動を確認: {e}")
+            die(f"cannot reach Ollama ({OLLAMA}); is `ollama serve` running? {e}")
         embs = data.get("embeddings")
         if not embs:
-            die(f"埋め込み取得失敗。モデル {MODEL} が無いかも: `ollama pull {MODEL}`（応答: {data}）")
+            die(f"no embeddings returned; is the model present? `ollama pull {MODEL}` (response: {data})")
         out.extend(embs)
     return out
 
@@ -65,7 +65,7 @@ def normalize(vec):
 
 # ---------- chunking ----------
 def chunk_file(path):
-    """-> list[(line_no, text)]  見出し単位。長い節は段落で分割。"""
+    """-> list[(line_no, text)]  one chunk per heading; long sections split on paragraphs."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.split("\n")
     sections, cur_start, cur = [], 0, []
@@ -88,7 +88,8 @@ def chunk_file(path):
         if len(body) <= MAX_CHUNK:
             chunks.append((start + 1, body))
             continue
-        # ponytail: 長節の分割は段落単位。サブchunkの行番号は節頭で近似（厳密追跡はやり過ぎ）
+        # Split long sections on paragraphs. Sub-chunk line numbers are approximated
+        # at the section start (exact per-sub-chunk tracking isn't worth the complexity).
         buf = ""
         for p in re.split(r"\n\s*\n", body):
             if buf and len(buf) + len(p) > MAX_CHUNK:
@@ -122,7 +123,7 @@ def iter_md():
 
 def cmd_index(rebuild=False):
     if not VAULT.is_dir():
-        die(f"VAULT が見つかりません: {VAULT}")
+        die(f"vault not found: {VAULT}")
     con = db_connect()
     if rebuild:
         con.execute("DELETE FROM files")
@@ -140,8 +141,8 @@ def cmd_index(rebuild=False):
         con.execute("DELETE FROM chunks WHERE path=?", (sp,))
         if chunks:
             vecs = embed([c[1] for c in chunks])
-            if len(vecs) != len(chunks):  # 数が合わないと zip が黙ってchunkを落とす
-                die(f"埋め込み数とchunk数が不一致 ({len(vecs)}!={len(chunks)})。Ollama応答を確認")
+            if len(vecs) != len(chunks):  # a mismatch would let zip() silently drop chunks
+                die(f"embedding count != chunk count ({len(vecs)}!={len(chunks)}); check Ollama response")
             for (line, txt), v in zip(chunks, vecs):
                 blob = array("f", normalize(v)).tobytes()
                 con.execute("INSERT INTO chunks(path, line, text, vec) VALUES(?,?,?,?)",
@@ -163,24 +164,25 @@ def cmd_index(rebuild=False):
 
 # ---------- search ----------
 def cosine_topn(qn, topn):
-    """qn: 正規化済みクエリベクトル -> [(score, cid)] 上位topn"""
+    """qn: normalized query vector -> [(score, cid)] top-n"""
     con = db_connect()
     qd = len(qn)
     scored = []
     for cid, blob in con.execute("SELECT id, vec FROM chunks"):
         v = array("f")
         v.frombytes(blob)
-        if len(v) != qd:  # モデル変更で次元がズレたら zip が黙って誤計算する。明示的に止める
-            die(f"ベクトル次元不一致 (query={qd}, index={len(v)})。"
-                f"モデルを変えたなら `vault-search index --rebuild` で作り直す")
-        # vもqnも正規化済み → dot = cosine。ponytail: 全件pure-python走査（実測~75ms/3千chunk、recall用途に十分）
+        if len(v) != qd:  # if the model changed, zip() would silently miscompute; stop explicitly
+            die(f"vector dimension mismatch (query={qd}, index={len(v)}); "
+                f"if you switched models, run `vault-search index --rebuild`")
+        # both v and qn are normalized -> dot == cosine.
+        # Brute-force pure-python scan (~75ms for ~3k chunks; plenty for recall).
         scored.append((sum(a * b for a, b in zip(qn, v)), cid))
     scored.sort(reverse=True)
     return scored[:topn]
 
 
 def keyword_hits(query):
-    """索引済み chunk text を直接 substring マッチ。外部 rg 不要。 -> dict[cid] = マッチ語数"""
+    """Substring-match indexed chunk text directly. No external rg. -> dict[cid] = matched terms"""
     terms = [t.lower() for t in re.split(r"\s+", query.strip()) if len(t) >= 2] \
         or [query.strip().lower()]
     con = db_connect()
@@ -202,7 +204,7 @@ def make_snippet(txt, n=140):
 def cmd_search(query, k):
     con = db_connect()
     if con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0:
-        die("索引が空です。先に `vault-search index` を実行してください。")
+        die("index is empty; run `vault-search index` first")
 
     qn = normalize(embed([query])[0])
     emb = cosine_topn(qn, 50)
@@ -212,7 +214,7 @@ def cmd_search(query, k):
     kw_rank = {cid: r for r, (cid, _) in
                enumerate(sorted(kw_score.items(), key=lambda x: -x[1]), 1)}
 
-    # RRF 融合
+    # Reciprocal Rank Fusion
     rrf = defaultdict(float)
     for cid, r in emb_rank.items():
         rrf[cid] += 1.0 / (RRF_K + r)
@@ -231,14 +233,14 @@ def cmd_search(query, k):
 
 
 def cmd_selfcheck():
-    """Ollama も DB も使わず、コアロジック（cosine / chunking / RRF）を検証。"""
+    """Verify core logic (cosine / chunking / RRF) without Ollama or the DB."""
     import tempfile
-    # cosine: 同一ベクトル=1、直交=0
+    # cosine: identical vectors -> 1, orthogonal -> 0
     a, b = normalize([1.0, 2.0, 3.0]), normalize([1.0, 2.0, 3.0])
     assert abs(sum(x * y for x, y in zip(a, b)) - 1.0) < 1e-6, "cosine identical"
     o1, o2 = normalize([1.0, 0.0]), normalize([0.0, 1.0])
     assert abs(sum(x * y for x, y in zip(o1, o2))) < 1e-6, "cosine orthogonal"
-    # chunking: 見出し分割と長節の段落分割
+    # chunking: heading split and long-section paragraph split
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
         f.write("# A\nalpha\n\n## B\nbeta\n\n## C\n" + "x " * 2000)
         tmp = f.name
@@ -248,7 +250,7 @@ def cmd_selfcheck():
         os.unlink(tmp)
     assert len(chunks) >= 3, f"chunking sections={len(chunks)}"
     assert chunks[0][0] == 1, "first chunk starts at line 1"
-    # RRF: 両リストに出る要素が最上位
+    # RRF: an item present in both lists ranks on top
     emb, kw = {1: 1, 2: 2, 3: 3}, {3: 1, 4: 2}
     rrf = defaultdict(float)
     for cid, r in emb.items():
@@ -276,11 +278,11 @@ def main():
         try:
             k = int(a[i + 1])
         except (IndexError, ValueError):
-            die("-k には数値を指定してください")
+            die("-k requires a number")
         a = a[:i] + a[i + 2:]
     query = " ".join(a).strip()
     if not query:
-        die("クエリが空です")
+        die("empty query")
     cmd_search(query, k)
 
 
