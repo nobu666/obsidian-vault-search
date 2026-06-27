@@ -65,8 +65,19 @@ The first index of a large vault takes a while (embedding is the bottleneck — 
 | `VAULT_SEARCH_DB` | `~/.cache/vault-search/index.db` | SQLite index location (safe to delete; regenerable) |
 | `VAULT_SEARCH_MODEL` | `bge-m3` | Ollama embedding model |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint |
+| `VAULT_SEARCH_NO_LOG` | unset | When `1`/`true`/`yes`/`on`, skip writing the query log (`query_log` table) |
 
 > If you change the model, run `vault-search index --rebuild` — embeddings of different dimensions can't be compared.
+
+### Ranking signals (beyond `emb` / `kw`)
+
+The hybrid ranker fuses keyword and embedding hits with RRF. On top of that, each result line may also include an `nb` tag:
+
+- `nb` — **1-hop neighbor boost.** Files reachable from the top RRF hits via Obsidian `[[wikilinks]]` (forward or back) or shared frontmatter `tags` get a small, sub-RRF-slot bump on every chunk they own. The point isn't to outrank the actual top hits — it's to let a tag-mate or a linked note slip into the bottom of the result set when it would otherwise drop off, so structurally-related-but-keyword-poor notes don't get lost. Anchors themselves are never boosted; the bump only lifts neighbors.
+
+### Query log (groundwork for a future "memory" axis)
+
+Every search also writes one row to a `query_log` table (`ts`, `query`, `returned_paths`) in the same SQLite DB. Nothing reads it yet — it's just sitting there. The intent is to eventually use it for a per-user "memory" axis that learns which documents your past similar queries actually leaned on. Set `VAULT_SEARCH_NO_LOG=1` to disable.
 
 ## Use it as your agent's memory recall
 

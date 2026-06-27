@@ -15,7 +15,7 @@ Environment overrides:
   VAULT_SEARCH_MODEL  default bge-m3
   OLLAMA_HOST         default http://localhost:11434
 """
-import os, sys, re, json, math, sqlite3, urllib.request, urllib.error
+import os, sys, re, json, math, sqlite3, time, urllib.request, urllib.error
 from array import array
 from pathlib import Path
 from collections import defaultdict
@@ -28,6 +28,15 @@ EXCLUDE_DIRS = {".obsidian", ".trash", ".git"}
 MAX_CHUNK = 1500   # characters; sections longer than this are split on paragraphs
 EMBED_BATCH = 32
 RRF_K = 60
+# How many top hits anchor the 1-hop neighbor expansion (link/tag), and how
+# strongly we boost neighbor chunks. Boost is a fraction of one RRF "slot" so
+# anchors stay on top — neighbors only break ties or lift near-miss candidates.
+NEIGHBOR_ANCHORS = 10
+NEIGHBOR_BOOST = 0.5 / (RRF_K + 1)  # ~half of a top-1 RRF slot
+# A file picks up neighbor boost from any anchor whose tag-overlap >= this fraction
+# of the anchor's tags. 1.0 = all-tags-match (strict). Avoids "common tag" floods.
+TAG_OVERLAP_MIN = 0.5
+LOG_ENABLED = os.environ.get("VAULT_SEARCH_NO_LOG", "").strip().lower() not in ("1", "true", "yes", "on")
 
 # Codepoint ranges stripped from displayed snippets. Notes may hold untrusted
 # content (web clippings, etc.) and snippets print to a terminal and/or feed an
@@ -70,6 +79,63 @@ def embed(texts):
 def normalize(vec):
     n = math.sqrt(sum(x * x for x in vec)) or 1.0
     return [x / n for x in vec]
+
+
+# ---------- link / tag extraction ----------
+# Wikilinks `[[Target]]` / `[[Target|alias]]` / `[[Target#heading]]`. We keep the
+# bare target (no alias, no subpath) and normalize: lowercase, strip leading
+# folder components — names collide rarely enough in a personal vault and the
+# boost is broad anyway, exact resolution isn't worth the complexity.
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]|#]+?)(?:#[^\[\]|]*)?(?:\|[^\[\]]*)?\]\]")
+# Inline `#tag` (Obsidian style, allowing `/` for nested). Avoid matching `#` in
+# Markdown headings (line-start `#` followed by space) and URLs (` #frag` after non-space).
+_INLINE_TAG_RE = re.compile(r"(?:^|[\s(\[])#([\w/-]+)", re.MULTILINE)
+# YAML frontmatter at the top: `---\n...\n---`. We pull `tags: ...` from it
+# (both inline list form and YAML block list form).
+_FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def _basename(name):
+    """Normalize a wikilink target or file path stem for comparison."""
+    n = Path(name).name.lower()
+    return n[:-3] if n.endswith(".md") else n  # str.removesuffix is 3.9+; keep 3.8 compat
+
+
+def _frontmatter_tags(fm_body):
+    """Pull `tags:` (inline `[a, b]` or YAML block list) from frontmatter body. Lowercased."""
+    out = set()
+    lines = fm_body.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.lower().startswith("tags:"):
+            rest = stripped.split(":", 1)[1].strip()
+            if rest.startswith("[") and rest.endswith("]"):
+                for t in rest[1:-1].split(","):
+                    t = t.strip().strip("\"'").lstrip("#").lower()
+                    if t:
+                        out.add(t)
+            elif not rest:  # YAML block list on following indented `- item` lines
+                j = i + 1
+                while j < len(lines) and re.match(r"^\s+-\s", lines[j]):
+                    t = lines[j].split("-", 1)[1].strip().strip("\"'").lstrip("#").lower()
+                    if t:
+                        out.add(t)
+                    j += 1
+                i = j - 1
+        i += 1
+    return out
+
+
+def extract_links_tags(text):
+    """-> (set[str] wikilink targets normalized, set[str] tags lowercased)"""
+    links = {_basename(m.group(1).strip()) for m in _WIKILINK_RE.finditer(text) if m.group(1).strip()}
+    tags = {t.lower() for t in _INLINE_TAG_RE.findall(text)}
+    m = _FRONTMATTER_RE.match(text)
+    if m:
+        tags |= _frontmatter_tags(m.group(1))
+    return links, tags
 
 
 # ---------- chunking ----------
@@ -119,6 +185,16 @@ def db_connect():
     con.execute("CREATE TABLE IF NOT EXISTS chunks("
                 "id INTEGER PRIMARY KEY, path TEXT, line INTEGER, text TEXT, vec BLOB)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path)")
+    # 1-hop neighbor structure: wikilink targets (basename-normalized) and tags per file.
+    con.execute("CREATE TABLE IF NOT EXISTS file_links(path TEXT, target TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_links_path ON file_links(path)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_links_target ON file_links(target)")
+    con.execute("CREATE TABLE IF NOT EXISTS file_tags(path TEXT, tag TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_tags_path ON file_tags(path)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_tags_tag ON file_tags(tag)")
+    # Query log — write-only here; consumed later when ④ (memory axis) is built.
+    con.execute("CREATE TABLE IF NOT EXISTS query_log("
+                "id INTEGER PRIMARY KEY, ts REAL, query TEXT, returned_paths TEXT)")
     return con
 
 
@@ -147,7 +223,11 @@ def cmd_index(rebuild=False):
         if stored.get(sp) == mt:
             continue
         chunks = chunk_file(path)
+        full_text = path.read_text(encoding="utf-8", errors="replace")
+        links, tags = extract_links_tags(full_text)
         con.execute("DELETE FROM chunks WHERE path=?", (sp,))
+        con.execute("DELETE FROM file_links WHERE path=?", (sp,))
+        con.execute("DELETE FROM file_tags WHERE path=?", (sp,))
         if chunks:
             vecs = embed([c[1] for c in chunks])
             if len(vecs) != len(chunks):  # a mismatch would let zip() silently drop chunks
@@ -157,6 +237,8 @@ def cmd_index(rebuild=False):
                 con.execute("INSERT INTO chunks(path, line, text, vec) VALUES(?,?,?,?)",
                             (sp, line, txt, blob))
             new_chunks += len(chunks)
+        con.executemany("INSERT INTO file_links(path, target) VALUES(?,?)", [(sp, t) for t in links])
+        con.executemany("INSERT INTO file_tags(path, tag) VALUES(?,?)", [(sp, t) for t in tags])
         con.execute("INSERT OR REPLACE INTO files(path, mtime) VALUES(?,?)", (sp, mt))
         changed += 1
         con.commit()
@@ -164,6 +246,8 @@ def cmd_index(rebuild=False):
     for sp in stored:
         if sp not in seen:
             con.execute("DELETE FROM chunks WHERE path=?", (sp,))
+            con.execute("DELETE FROM file_links WHERE path=?", (sp,))
+            con.execute("DELETE FROM file_tags WHERE path=?", (sp,))
             con.execute("DELETE FROM files WHERE path=?", (sp,))
             removed += 1
     con.commit()
@@ -211,6 +295,75 @@ def make_snippet(txt, n=140):
     return s[:n] + ("…" if len(s) > n else "")
 
 
+def _neighbor_paths(con, anchor_paths):
+    """1-hop neighbors of anchor_paths: link targets, files that link to anchors,
+    and files that share >= TAG_OVERLAP_MIN of an anchor's tags. -> set[str]."""
+    if not anchor_paths:
+        return set()
+    anchors = list(anchor_paths)
+    placeholders = ",".join("?" * len(anchors))
+    neighbors = set()
+
+    # anchor -> its link targets -> resolve back to files whose basename matches
+    targets = {t for (t,) in con.execute(
+        f"SELECT DISTINCT target FROM file_links WHERE path IN ({placeholders})", anchors)}
+    if targets:
+        tph = ",".join("?" * len(targets))
+        for (p,) in con.execute(f"SELECT path FROM files"):
+            if _basename(p) in targets:
+                neighbors.add(p)
+
+    # files that link TO any anchor (backlinks). Anchor basenames -> file_links.target
+    anchor_bases = {_basename(p) for p in anchors}
+    if anchor_bases:
+        abph = ",".join("?" * len(anchor_bases))
+        for (p,) in con.execute(
+            f"SELECT DISTINCT path FROM file_links WHERE target IN ({abph})",
+            list(anchor_bases),
+        ):
+            neighbors.add(p)
+
+    # tag overlap: any file sharing >= TAG_OVERLAP_MIN fraction of an anchor's tags
+    anchor_tags = defaultdict(set)
+    for p, t in con.execute(
+        f"SELECT path, tag FROM file_tags WHERE path IN ({placeholders})", anchors,
+    ):
+        anchor_tags[p].add(t)
+    if anchor_tags:
+        # candidate files: any file sharing at least one tag with any anchor
+        all_tags = set().union(*anchor_tags.values())
+        if all_tags:
+            tagph = ",".join("?" * len(all_tags))
+            cand = defaultdict(set)
+            for p, t in con.execute(
+                f"SELECT path, tag FROM file_tags WHERE tag IN ({tagph})", list(all_tags),
+            ):
+                cand[p].add(t)
+            for cp, ct in cand.items():
+                for ap, at in anchor_tags.items():
+                    if cp == ap or not at:
+                        continue
+                    if len(ct & at) / len(at) >= TAG_OVERLAP_MIN:
+                        neighbors.add(cp)
+                        break
+
+    neighbors -= set(anchors)  # don't double-boost anchors themselves
+    return neighbors
+
+
+def _log_query(con, query, returned_paths):
+    if not LOG_ENABLED:
+        return
+    try:
+        con.execute(
+            "INSERT INTO query_log(ts, query, returned_paths) VALUES(?,?,?)",
+            (time.time(), query, "\n".join(returned_paths)),
+        )
+        con.commit()
+    except sqlite3.Error:
+        pass  # logging is best-effort; never break a search on it
+
+
 def cmd_search(query, k):
     con = db_connect()
     if con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0:
@@ -230,16 +383,47 @@ def cmd_search(query, k):
         rrf[cid] += 1.0 / (RRF_K + r)
     for cid, r in kw_rank.items():
         rrf[cid] += 1.0 / (RRF_K + r)
+
+    # 1-hop neighbor boost: top anchors' linked/backlinked/tag-overlap files
+    # each get a fixed small bump on every chunk they own. Tie-breaks + near-miss
+    # lifts only — the boost is < one top-1 RRF slot so anchors stay on top.
+    pre_top = sorted(rrf.items(), key=lambda x: -x[1])[:NEIGHBOR_ANCHORS]
+    anchor_paths = set()
+    nb_neighbors = set()
+    if pre_top:
+        pre_ids = [cid for cid, _ in pre_top]
+        anchor_paths = {p for (p,) in con.execute(
+            f"SELECT DISTINCT path FROM chunks WHERE id IN ({','.join('?' * len(pre_ids))})",
+            pre_ids,
+        )}
+        nb_neighbors = _neighbor_paths(con, anchor_paths)
+        if nb_neighbors:
+            placeholders = ",".join("?" * len(nb_neighbors))
+            for (cid,) in con.execute(
+                f"SELECT id FROM chunks WHERE path IN ({placeholders})", list(nb_neighbors),
+            ):
+                rrf[cid] += NEIGHBOR_BOOST
+
     ranked = sorted(rrf.items(), key=lambda x: -x[1])[:k]
 
     if not ranked:
         print("(no hits)")
+        _log_query(con, query, [])
         return
+    returned_paths = []
     for cid, _ in ranked:
         p, ln, txt = con.execute("SELECT path, line, text FROM chunks WHERE id=?", (cid,)).fetchone()
         rel = os.path.relpath(p, VAULT)
-        tag = "+".join([t for t, ok in (("emb", cid in emb_rank), ("kw", cid in kw_rank)) if ok])
-        print(f"{rel}:{ln}  [{tag}]  {make_snippet(txt)}")
+        tags = []
+        if cid in emb_rank:
+            tags.append("emb")
+        if cid in kw_rank:
+            tags.append("kw")
+        if p in nb_neighbors:
+            tags.append("nb")
+        print(f"{rel}:{ln}  [{'+'.join(tags)}]  {make_snippet(txt)}")
+        returned_paths.append(rel)
+    _log_query(con, query, returned_paths)
 
 
 def cmd_selfcheck():
@@ -272,6 +456,17 @@ def cmd_selfcheck():
     for cid, r in kw.items():
         rrf[cid] += 1.0 / (RRF_K + r)
     assert max(rrf, key=rrf.get) == 3, "RRF fuses overlap to top"
+    # link / tag extraction: wikilinks (with alias/subpath), inline #tag, frontmatter tags
+    text = ("---\ntags: [foo, bar]\nrelated:\n  - X\n---\n"
+            "# T\nsee [[Other|alias]] and [[Sub#heading]] and #baz here.\n")
+    links, tags = extract_links_tags(text)
+    assert links == {"other", "sub"}, f"wikilinks: {links}"
+    assert tags == {"foo", "bar", "baz"}, f"tags: {tags}"
+    # frontmatter YAML block list form
+    _, tags2 = extract_links_tags("---\ntags:\n  - one\n  - two\n---\n# T\n")
+    assert tags2 == {"one", "two"}, f"yaml block tags: {tags2}"
+    # neighbor boost must be smaller than one top-1 RRF slot (so anchors keep priority)
+    assert NEIGHBOR_BOOST < 1.0 / (RRF_K + 1), "neighbor boost should be < a top-1 RRF slot"
     print("selfcheck: ok")
 
 
