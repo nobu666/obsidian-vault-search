@@ -65,8 +65,25 @@ The first index of a large vault takes a while (embedding is the bottleneck — 
 | `VAULT_SEARCH_DB` | `~/.cache/vault-search/index.db` | SQLite index location (safe to delete; regenerable) |
 | `VAULT_SEARCH_MODEL` | `bge-m3` | Ollama embedding model |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint |
+| `VAULT_SEARCH_NO_LOG` | unset | When `1`/`true`/`yes`/`on`, skip writing the query log (`query_log` table) |
 
 > If you change the model, run `vault-search index --rebuild` — embeddings of different dimensions can't be compared.
+
+### Ranking signals (beyond `emb` / `kw`)
+
+The hybrid ranker fuses keyword and embedding hits with RRF. On top of that, each result line may also include an `nb` tag:
+
+- `nb` — **1-hop neighbor boost.** Files reachable from the top RRF hits via Obsidian `[[wikilinks]]` (forward or back) or shared frontmatter `tags` get a small, sub-RRF-slot bump on every chunk they own. The point isn't to outrank the actual top hits — it's to let a tag-mate or a linked note slip into the bottom of the result set when it would otherwise drop off, so structurally-related-but-keyword-poor notes don't get lost. Anchors themselves are never boosted; the bump only lifts neighbors.
+
+### Query log (groundwork for a future "memory" axis)
+
+Every search also writes one row to a `query_log` table (`ts`, `query`, `returned_paths`) in the same SQLite DB. Nothing reads it yet — it's just sitting there. The intent is to eventually use it for a per-user "memory" axis that learns which documents your past similar queries actually leaned on. Set `VAULT_SEARCH_NO_LOG=1` to disable.
+
+> The raw query string is stored as-is. Don't paste secrets (API keys, passwords, tokens) into searches — they end up in `query_log`. The DB file is `chmod 0600` on every open as a defence-in-depth measure, but `VAULT_SEARCH_NO_LOG=1` is the only way to keep secrets out of the file entirely.
+
+### Upgrading from a pre-`nb` index
+
+The `nb` (neighbor) ranking signal needs the new `file_links` / `file_tags` tables to be populated. They're created on first run, but files whose `mtime` hasn't changed will be skipped on a normal `vault-search index` — so you'll see no `nb` hits until something gets re-indexed. Run `vault-search index --rebuild` once to populate links/tags for the whole vault.
 
 ## Use it as your agent's memory recall
 
