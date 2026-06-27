@@ -79,6 +79,12 @@ The hybrid ranker fuses keyword and embedding hits with RRF. On top of that, eac
 
 Every search also writes one row to a `query_log` table (`ts`, `query`, `returned_paths`) in the same SQLite DB. Nothing reads it yet — it's just sitting there. The intent is to eventually use it for a per-user "memory" axis that learns which documents your past similar queries actually leaned on. Set `VAULT_SEARCH_NO_LOG=1` to disable.
 
+> The raw query string is stored as-is. Don't paste secrets (API keys, passwords, tokens) into searches — they end up in `query_log`. The DB file is `chmod 0600` on every open as a defence-in-depth measure, but `VAULT_SEARCH_NO_LOG=1` is the only way to keep secrets out of the file entirely.
+
+### Upgrading from a pre-`nb` index
+
+The `nb` (neighbor) ranking signal needs the new `file_links` / `file_tags` tables to be populated. They're created on first run, but files whose `mtime` hasn't changed will be skipped on a normal `vault-search index` — so you'll see no `nb` hits until something gets re-indexed. Run `vault-search index --rebuild` once to populate links/tags for the whole vault.
+
 ## Use it as your agent's memory recall
 
 The point of the CLI shape is that an agent can call it. For example, with Claude Code, add a rule that tells the agent to refresh the index and search the vault before answering:

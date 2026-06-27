@@ -181,6 +181,12 @@ def chunk_file(path):
 def db_connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    # The DB now stores the query log (raw query strings). Tighten perms to 0600
+    # so a stray secret in a query isn't world-readable on shared systems. Best-effort.
+    try:
+        os.chmod(DB_PATH, 0o600)
+    except OSError:
+        pass
     con.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS chunks("
                 "id INTEGER PRIMARY KEY, path TEXT, line INTEGER, text TEXT, vec BLOB)")
