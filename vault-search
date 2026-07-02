@@ -10,10 +10,13 @@ Usage:
   vault-search selfcheck               run internal tests (no Ollama needed)
 
 Environment overrides:
-  VAULT_DIR           default ~/Documents/Obsidian/Vault
-  VAULT_SEARCH_DB     default ~/.cache/vault-search/index.db
-  VAULT_SEARCH_MODEL  default bge-m3
-  OLLAMA_HOST         default http://localhost:11434
+  VAULT_DIR             default ~/Documents/Obsidian/Vault
+  VAULT_SEARCH_DB       default ~/.cache/vault-search/index.db
+  VAULT_SEARCH_MODEL    default bge-m3
+  OLLAMA_HOST           default http://localhost:11434
+  VAULT_SEARCH_EXCLUDE  extra directory names to skip while indexing,
+                        comma-separated (e.g. "News,Attachments"); matched by
+                        name at any depth, added to the built-in excludes
 """
 import os, sys, re, json, math, sqlite3, time, urllib.request, urllib.error
 from array import array
@@ -24,7 +27,13 @@ VAULT = Path(os.environ.get("VAULT_DIR", Path.home() / "Documents/Obsidian/Vault
 DB_PATH = Path(os.environ.get("VAULT_SEARCH_DB", Path.home() / ".cache/vault-search/index.db"))
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.environ.get("VAULT_SEARCH_MODEL", "bge-m3")
-EXCLUDE_DIRS = {".obsidian", ".trash", ".git"}
+def _parse_exclude(raw):
+    """Comma-separated dir names -> set (blanks dropped, whitespace stripped)."""
+    return {d.strip() for d in raw.split(",") if d.strip()}
+
+
+EXCLUDE_DIRS = {".obsidian", ".trash", ".git"} | _parse_exclude(
+    os.environ.get("VAULT_SEARCH_EXCLUDE", ""))
 MAX_CHUNK = 1500   # characters; sections longer than this are split on paragraphs
 EMBED_BATCH = 32
 RRF_K = 60

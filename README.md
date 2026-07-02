@@ -66,6 +66,7 @@ The first index of a large vault takes a while (embedding is the bottleneck — 
 | `VAULT_SEARCH_MODEL` | `bge-m3` | Ollama embedding model |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint |
 | `VAULT_SEARCH_NO_LOG` | unset | When `1`/`true`/`yes`/`on`, skip writing the query log (`query_log` table) |
+| `VAULT_SEARCH_EXCLUDE` | unset | Extra directory names to skip while indexing, comma-separated (e.g. `News,Attachments`). Matched by name at any depth, on top of the built-in `.obsidian`/`.trash`/`.git`. Already-indexed files under a newly excluded dir are pruned on the next `index` run |
 
 > If you change the model, run `vault-search index --rebuild` — embeddings of different dimensions can't be compared.
 

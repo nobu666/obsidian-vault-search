@@ -192,5 +192,33 @@ class VaultSearchTest(unittest.TestCase):
             os.environ.pop("VAULT_SEARCH_NO_LOG", None)
 
 
+    def test_parse_exclude(self):
+        m = load_module(self.vault, self.db)
+        self.assertEqual(m._parse_exclude(""), set())
+        self.assertEqual(m._parse_exclude("News"), {"News"})
+        self.assertEqual(m._parse_exclude(" News , Attachments ,, "), {"News", "Attachments"})
+
+    def test_exclude_env_skips_and_prunes(self):
+        write(self.vault / "keep.md", "# K\nalpha\n", mtime=1000)
+        write(self.vault / "News" / "old.md", "# N\nbeta\n", mtime=1000)
+        m = load_module(self.vault, self.db)
+        self.run_index(m)
+        self.assertEqual(self.count_chunks(m), 2)
+
+        # Reload with the exclude set: News/ is skipped and its already-indexed
+        # chunks are pruned by the normal deleted-file detection.
+        os.environ["VAULT_SEARCH_EXCLUDE"] = "News, Attachments"
+        try:
+            m = load_module(self.vault, self.db)
+        finally:
+            os.environ.pop("VAULT_SEARCH_EXCLUDE", None)
+        self.assertIn("News", m.EXCLUDE_DIRS)
+        self.assertIn(".obsidian", m.EXCLUDE_DIRS)  # built-ins stay
+        out = self.run_index(m)
+        self.assertIn("1 removed", out)
+        self.assertEqual(self.count_chunks(m, self.vault / "News" / "old.md"), 0)
+        self.assertEqual(self.count_chunks(m), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
