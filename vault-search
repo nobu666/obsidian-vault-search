@@ -76,6 +76,8 @@ def embed(texts):
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
                 data = json.load(r)
+        except urllib.error.HTTPError as e:
+            die(f"Ollama returned HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
         except urllib.error.URLError as e:
             die(f"cannot reach Ollama ({OLLAMA}); is `ollama serve` running? {e}")
         embs = data.get("embeddings")
@@ -148,6 +150,25 @@ def extract_links_tags(text):
 
 
 # ---------- chunking ----------
+def _split_long(p):
+    """Split a paragraph longer than MAX_CHUNK on line breaks; hard-cut a single line that is still too long.
+
+    Ollama rejects input over the model's context length (HTTP 413) instead of truncating it.
+    """
+    out, buf = [], ""
+    for ln in p.split("\n"):
+        for i in range(0, max(len(ln), 1), MAX_CHUNK):
+            seg = ln[i:i + MAX_CHUNK]
+            if buf and len(buf) + len(seg) + 1 > MAX_CHUNK:
+                out.append(buf)
+                buf = seg
+            else:
+                buf = (buf + "\n" + seg) if buf else seg
+    if buf:
+        out.append(buf)
+    return out
+
+
 def chunk_file(path):
     """-> list[(line_no, text)]  one chunk per heading; long sections split on paragraphs."""
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -175,7 +196,10 @@ def chunk_file(path):
         # Split long sections on paragraphs. Sub-chunk line numbers are approximated
         # at the section start (exact per-sub-chunk tracking isn't worth the complexity).
         buf = ""
+        paras = []
         for p in re.split(r"\n\s*\n", body):
+            paras.extend(_split_long(p) if len(p) > MAX_CHUNK else [p])
+        for p in paras:
             if buf and len(buf) + len(p) > MAX_CHUNK:
                 chunks.append((start + 1, buf.strip()))
                 buf = p

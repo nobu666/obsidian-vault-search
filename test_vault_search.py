@@ -12,6 +12,7 @@ import io
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 
 
@@ -29,6 +30,7 @@ def load_module(vault_dir, db_path):
     m = importlib.util.module_from_spec(spec)
     loader.exec_module(m)
     # Deterministic 3-dim fake embeddings (no Ollama): flags for 'alpha' / 'beta'.
+    m.real_embed = m.embed  # kept so tests can exercise the HTTP error path
     m.embed = lambda texts: [
         [1.0 if "alpha" in t else 0.0, 1.0 if "beta" in t else 0.0, 0.1] for t in texts
     ]
@@ -191,6 +193,38 @@ class VaultSearchTest(unittest.TestCase):
         finally:
             os.environ.pop("VAULT_SEARCH_NO_LOG", None)
 
+
+    def test_oversized_paragraph_is_split(self):
+        # A newline-free blob and a long multi-line paragraph (no blank lines) must
+        # both end up in chunks <= MAX_CHUNK, with no content lost.
+        m = load_module(self.vault, self.db)
+        blob = "x" * (m.MAX_CHUNK * 2 + 10)
+        lines = "\n".join(f"- item {i} alpha" for i in range(400))
+        f = self.vault / "big.md"
+        write(f, f"# Big\n{blob}\n\n## Lines\n{lines}\n")
+        chunks = m.chunk_file(f)
+        self.assertTrue(all(len(t) <= m.MAX_CHUNK for _, t in chunks))
+        self.assertEqual("".join(t for _, t in chunks).count("x"), len(blob))
+        self.assertIn("- item 399 alpha", chunks[-1][1])
+
+    def test_embed_reports_http_error_status(self):
+        # HTTPError is a URLError subclass; a 413 must not be reported as "cannot reach Ollama".
+        m = load_module(self.vault, self.db)
+
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 413, "Request Entity Too Large", {},
+                io.BytesIO(b'{"error":"the input length exceeds the context length"}'))
+
+        orig, m.urllib.request.urlopen = m.urllib.request.urlopen, fake_urlopen
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                m.real_embed(["x"])
+        finally:
+            m.urllib.request.urlopen = orig
+        self.assertIn("HTTP 413", err.getvalue())
+        self.assertIn("exceeds the context length", err.getvalue())
+        self.assertNotIn("cannot reach", err.getvalue())
 
     def test_parse_exclude(self):
         m = load_module(self.vault, self.db)
