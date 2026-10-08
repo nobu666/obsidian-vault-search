@@ -192,6 +192,19 @@ class VaultSearchTest(unittest.TestCase):
             os.environ.pop("VAULT_SEARCH_NO_LOG", None)
 
 
+    def test_oversized_paragraph_is_split(self):
+        # A newline-free blob and a long multi-line paragraph (no blank lines) must
+        # both end up in chunks <= MAX_CHUNK, with no content lost.
+        m = load_module(self.vault, self.db)
+        blob = "x" * (m.MAX_CHUNK * 2 + 10)
+        lines = "\n".join(f"- item {i} alpha" for i in range(400))
+        f = self.vault / "big.md"
+        write(f, f"# Big\n{blob}\n\n## Lines\n{lines}\n")
+        chunks = m.chunk_file(f)
+        self.assertTrue(all(len(t) <= m.MAX_CHUNK for _, t in chunks))
+        self.assertEqual("".join(t for _, t in chunks).count("x"), len(blob))
+        self.assertIn("- item 399 alpha", chunks[-1][1])
+
     def test_parse_exclude(self):
         m = load_module(self.vault, self.db)
         self.assertEqual(m._parse_exclude(""), set())
